@@ -1,0 +1,153 @@
+# I use add_file_exclusions as a input becuase I would use it in common in most of my repos. This could also be a variable.
+on:
+  workflow_call:
+    inputs:  # Defines the inputs that can be passed from the caller workflow
+      add_file_exclusions:  # Name of the input. Used to additional file type exclusions
+          required: false  # Specifies that this input is not mandatory
+          type: string  # Specifies the type of the input
+
+# mandatory repo variables
+# vars.FORGE_EXTENSION: the file extension, i.e., .ext, .mod
+
+# optional repo variables/secrets
+# If you specify FORGE_ITEM_ID, you must specify the other two FORGE items
+# vars.FORGE_ITEM_ID
+# vars.FORGE_USER_NAME
+# secrets.FORGE_USER_PASS
+
+name: Release Build
+
+permissions: write-all
+
+env:
+  EXTENSION: ${{ vars.FORGE_EXTENSION }}
+  IS_PRERELEASE: ${{ contains(github.ref_name,'-rc') }} && ${{ contains(github.ref_name,'-beta') }}
+  FILE_TYPE_EXCLUSIONS: '*.git* /*node_modules/* .editorconfig body.md *.psd *.xcf forge-thumbnail.png thumbnail.png *.toml ${{ inputs.add_file_exclusions }}'
+
+jobs:
+  build:
+    name: Create Release
+    runs-on: ubuntu-latest
+    steps:   
+    - name: Checkout Repo Assets
+      uses: actions/checkout@v4
+
+    # Replacing ~dev_version~" is from MeAndUnique and rhagelstrom. These are only changed for the build object
+    # Replace "~dev_version~" with the tag that was used to start this run
+    - name: Replace Version
+      uses: jacobtomlinson/gha-find-replace@v3
+      with:
+        find: '~dev_version~'
+        exclude: ${{ env.FILE_TYPE_EXCLUSIONS }}
+        replace: ${{github.ref_name}}
+  
+    # used later to get the major and minor version numbers
+    - id: get_version
+      uses: maltoze/get-version-action@v1
+  
+    # replace "~dev_version_short~" with the major.minor version. FG only uses the major and minor for version
+    - name: Replace Version
+      uses: jacobtomlinson/gha-find-replace@v3
+      with:
+        find: '~dev_version_short~'
+        exclude: ${{ env.FILE_TYPE_EXCLUSIONS }}
+        replace: ${{ steps.get_version.outputs.major }}.${{ steps.get_version.outputs.minor }}
+
+    - name: Zip Assets Into ${{ env.EXTENSION }} File
+      uses: thedoctor0/zip-release@0.7.6
+      with:
+        filename: ${{ github.event.repository.name }}${{ env.EXTENSION }}
+        exclusions: ${{ env.FILE_TYPE_EXCLUSIONS }}
+    
+    - name: Add ${{ env.EXTENSION }} File to Release
+      uses: ncipollo/release-action@v1
+      with:
+        artifacts: ${{ github.event.repository.name }}${{ env.EXTENSION }}
+        prerelease: ${{ env.IS_PRERELEASE != 'false && false' }}
+        allowUpdates: true
+        generateReleaseNotes: true
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: ${{ github.event.repository.name }}${{ env.EXTENSION }}
+        path: ${{ github.event.repository.name }}${{ env.EXTENSION }}
+        
+  upload:
+    name: Upload to Forge
+    runs-on: ubuntu-latest
+    needs: build
+    if: ${{ vars.FORGE_ITEM_ID != '' }}
+    steps:
+      - name: Checkout FG-Forge-Updater repository
+        uses: actions/checkout@v4
+        with:
+          repository: 'bmos/FG-Forge-Updater'
+          ref: 'v1.1'
+
+      - name: Set up python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: 'pip'
+
+      - name: Install uv and create venv
+        run: |
+          pip install -U pip uv
+          uv venv
+
+      - name: Enable macOS/Linux venv
+        if: runner.os != 'Windows'
+        run: |
+          source .venv/bin/activate
+          echo $PATH >> $GITHUB_PATH
+
+      - name: Enable Windows venv
+        if: runner.os == 'Windows'
+        run: |
+          .venv\Scripts\activate
+          echo $env:path >> $ENV:GITHUB_PATH
+
+      - name: Install dependencies
+        run: |
+          uv pip install -e .
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ github.event.repository.name }}${{ env.EXTENSION }}
+
+      - name: Upload ${{ env.EXTENSION }} file to live channel
+        id: upload-live
+        if: ${{ env.IS_PRERELEASE == 'false && false' }}
+        env:
+          FG_RELEASE_CHANNEL: Live
+          FG_ITEM_ID: ${{ vars.FORGE_ITEM_ID }}
+          FG_USER_NAME: ${{ vars.FORGE_USER_NAME }}
+          FG_USER_PASS: ${{ secrets.FORGE_USER_PASS }}
+          FG_UL_FILE: ${{ github.event.repository.name }}${{ env.EXTENSION }}
+          FG_README_UPDATE: "TRUE"
+          FG_UPLOAD_BUILD: "TRUE"
+          FG_GRAPH_SALES: "TRUE"
+        run: |
+          python -m src.main
+
+      - name: Upload ${{ env.EXTENSION }} file to test channel
+        id: upload-test
+        if: ${{ env.IS_PRERELEASE != 'false && false' }}
+        env:
+          FG_RELEASE_CHANNEL: Test
+          FG_ITEM_ID: ${{ vars.FORGE_ITEM_ID }}
+          FG_USER_NAME: ${{ vars.FORGE_USER_NAME }}
+          FG_USER_PASS: ${{ secrets.FORGE_USER_PASS }}
+          FG_UL_FILE: ${{ github.event.repository.name }}${{ env.EXTENSION }}
+          FG_README_UPDATE: "FALSE"
+          FG_UPLOAD_BUILD: "TRUE"
+          FG_GRAPH_SALES: "TRUE"
+        run: |
+          python -m src.main
+
+      - name: Add cumulative users graph to release
+        uses: ncipollo/release-action@v1
+        with:
+          body: "![Cumulative Users Graph](https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/cumulative_users.png)"
+          artifacts: cumulative_users.png
+          allowUpdates: true
